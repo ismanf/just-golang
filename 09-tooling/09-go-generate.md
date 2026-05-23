@@ -1,0 +1,465 @@
+# `go generate` — Pre-Build Code Generation
+
+## TL;DR
+
+`go generate` scans Go source for `//go:generate <command>` directives, then runs each command in the directory of the file that contains it. It does **not** look at imports or dependencies — it just shells out. The output (almost always more `.go` files) is then compiled by `go build`/`go test` as if you'd written it. The convention is to use it for code that derives from other code: `stringer` for enum-to-string, `mockgen` for interface mocks, `protoc-gen-go` for protobuf, `sqlc` for type-safe SQL, `go-bindata` (legacy) and `embed` (modern) for asset embedding. The generated files are typically named `*_string.go`, `mock_*.go`, or end with `.gen.go` and are committed to source control — `go generate` is **not** run as part of `go build`, so the build must see ready-made output.
+
+## Mental Model
+
+```
+   .go file
+        │  contains //go:generate stringer -type=Color
+        ▼
+   go generate ./...        (you run this; CI usually doesn't)
+        │
+        ▼
+   parse files, find directives
+        │
+        ▼
+   for each directive:
+        chdir to file's directory
+        run the command verbatim
+        │
+        ▼
+   command writes color_string.go
+        │
+        ▼
+   go build ./...           (sees both source and generated; doesn't care which is which)
+```
+
+`go generate` is a *developer-time* tool. The output is committed; the build never invokes it.
+
+## Syntax & Basic Usage
+
+```bash
+$ go generate                       # current dir
+$ go generate ./...                 # whole module
+$ go generate -v ./...              # verbose
+$ go generate -n ./...              # dry-run (print commands, don't run)
+$ go generate -x ./...              # print each command before running
+$ go generate -run='regex' ./...    # only directives whose command matches regex
+$ go generate -skip='regex' ./...   # opposite of -run
+$ go generate -tags=integration ./...   # respect build tags
+```
+
+A directive:
+
+```go
+//go:generate stringer -type=Color
+//go:generate mockgen -source=user.go -destination=mock_user.go
+//go:generate protoc --go_out=. --go-grpc_out=. proto/api.proto
+```
+
+Note: `//go:generate` (no space after `//`) is required; `// go:generate` (with space) is ignored.
+
+## Deep Dive
+
+### Directive grammar
+
+```
+//go:generate <command> [args ...]
+```
+
+- Must be a *line comment* (`//`, not `/* */`).
+- Must start with `//go:` (no space).
+- Must appear in a `.go` file (any kind: regular, `_test.go`, generated, etc.).
+- Lines are processed in source order.
+- Variables `$GOPATH`, `$GOFILE`, `$GOPACKAGE`, `$GOLINE`, `$GOROOT`, `$DOLLAR`, and any environment variables are substituted.
+- Commands run in the directory of the file containing the directive.
+
+Substituted variables:
+
+| Var          | Meaning                                                            |
+|--------------|--------------------------------------------------------------------|
+| `$GOFILE`    | Name of the file containing the directive.                         |
+| `$GOLINE`    | Line number of the directive.                                       |
+| `$GOPACKAGE` | Name of the package containing the file.                            |
+| `$GOROOT`    | The Go installation root.                                           |
+| `$GOPATH`    | The first entry on `$GOPATH`.                                       |
+| `$DOLLAR`    | A literal `$` (for cases where the shell or `go generate` would otherwise interpret). |
+| `$GOOS`/`$GOARCH` | Target platform (since 1.17).                                 |
+
+Example:
+
+```go
+//go:generate stringer -type=Color -output=$GOFILE.gen.go
+```
+
+### Selection: `-run` and `-skip`
+
+```bash
+$ go generate -run=stringer ./...       # only run stringer directives
+$ go generate -skip=protoc ./...        # skip protobuf generation (slow)
+```
+
+The regex matches the *command line* of each directive.
+
+### Tool versioning
+
+`go generate`'s biggest weakness: the directive line says `stringer -type=Color` but doesn't pin a version. Two contributors with different `stringer` installs produce different output.
+
+**Solution 1 — `go run` with version suffix** (since 1.17):
+
+```go
+//go:generate go run golang.org/x/tools/cmd/stringer@v0.20.0 -type=Color
+```
+
+Now every run pulls the exact same version from the proxy.
+
+**Solution 2 — `tools.go` (pre-1.24)**:
+
+```go
+//go:build tools
+package tools
+import _ "golang.org/x/tools/cmd/stringer"
+```
+
+Then `go install golang.org/x/tools/cmd/stringer` resolves the version from `go.mod`.
+
+**Solution 3 — `go.mod` `tool` directive (1.24+)**:
+
+```
+// go.mod
+tool golang.org/x/tools/cmd/stringer
+```
+
+```go
+//go:generate go tool stringer -type=Color
+```
+
+Now `stringer` runs the version pinned in `go.mod` automatically.
+
+Solution 3 is the modern best practice.
+
+### `stringer`: enum-to-string
+
+```go
+package types
+
+//go:generate stringer -type=Color
+
+type Color int
+
+const (
+    Red Color = iota
+    Green
+    Blue
+)
+```
+
+After `go generate`:
+
+```go
+// Code generated by "stringer -type=Color"; DO NOT EDIT.
+package types
+
+import "strconv"
+
+const _Color_name = "RedGreenBlue"
+var _Color_index = [...]uint8{0, 3, 8, 12}
+
+func (i Color) String() string {
+    if i < 0 || i >= Color(len(_Color_index)-1) {
+        return "Color(" + strconv.FormatInt(int64(i), 10) + ")"
+    }
+    return _Color_name[_Color_index[i]:_Color_index[i+1]]
+}
+```
+
+Saves writing a switch by hand and stays in sync with the constants.
+
+### `mockgen`: interface mocks (gomock)
+
+```go
+package store
+
+//go:generate mockgen -source=$GOFILE -destination=mock/mock_store.go -package=mock
+type Store interface {
+    Get(id string) (Item, error)
+    Put(item Item) error
+}
+```
+
+Produces a mock implementation under `mock/`. See `10-testing/09-mocking-strategies.md`.
+
+### `protoc-gen-go` / `protoc-gen-go-grpc`
+
+```go
+//go:generate protoc --go_out=. --go_opt=paths=source_relative \
+                   --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+                   proto/api.proto
+```
+
+Needs `protoc` installed plus the two `protoc-gen-*` plugins on `$PATH`. Or use `buf`:
+
+```go
+//go:generate buf generate proto
+```
+
+### `sqlc`
+
+```go
+//go:generate sqlc generate
+```
+
+Reads `sqlc.yaml`, generates type-safe SQL bindings.
+
+### `go-bindata` (legacy) vs. `embed`
+
+`go-bindata` embedded files as Go source pre-`embed`. Since Go 1.16, use:
+
+```go
+import "embed"
+
+//go:embed static/*
+var staticFS embed.FS
+```
+
+`go generate` doesn't need to run; the compiler does the embedding directly. See `08-stdlib/30-embed.md`.
+
+### Generated file header convention
+
+Generated files must start with a line matching:
+
+```
+^// Code generated .* DO NOT EDIT\.$
+```
+
+This is recognized by:
+
+- `gopls` (hides from refactoring suggestions).
+- `go vet` (some analyzers skip generated files).
+- `golangci-lint` (skip configurable).
+- `git diff -- ':!**.gen.go'` (developer convention).
+
+Always start your generators' output with this line.
+
+### Build tags on generated files
+
+```go
+//go:build !nogen
+// +build !nogen
+
+// Code generated by ... ; DO NOT EDIT.
+package foo
+```
+
+Lets you build without the generated code (e.g., bootstrapping from a clean repo before generation has run).
+
+### Idempotency
+
+`go generate` should be **idempotent**: running it twice produces the same output. Tools that include timestamps in output break this (and break reproducible builds). Avoid them or pass flags to disable timestamps.
+
+### Parallelism
+
+`go generate` runs directives **sequentially** within a file and across files. There's no `-jobs` flag. For parallel generation, write a shell loop or use `make -j`.
+
+### `go generate` and CI
+
+CI typically doesn't run `go generate`. Instead, it *verifies* that the generated files are up to date:
+
+```yaml
+- run: go generate ./...
+- run: git diff --exit-code
+```
+
+If a contributor forgot to regenerate, CI fails with a useful diff.
+
+### `go generate` and modules
+
+`go generate` doesn't fetch dependencies. If the directive runs `stringer` and `stringer` isn't installed, the command fails. Either:
+
+- Pre-install via `go install` (pre-CI step).
+- Use `go run pkg@version` in the directive.
+- Use `go tool` (1.24+).
+
+The `tool` directive (1.24+) is the cleanest.
+
+### Custom generators
+
+Anything that produces `.go` files works:
+
+```go
+//go:generate go run ./internal/codegen
+```
+
+Calls `internal/codegen/main.go`'s `main`. It can use `text/template` to render output:
+
+```go
+package main
+
+import (
+    "os"
+    "text/template"
+)
+
+const tmpl = `// Code generated; DO NOT EDIT.
+package {{.Package}}
+
+var Version = "{{.Version}}"
+`
+
+func main() {
+    t := template.Must(template.New("v").Parse(tmpl))
+    f, _ := os.Create("version.go")
+    defer f.Close()
+    t.Execute(f, map[string]string{"Package": "main", "Version": os.Getenv("VERSION")})
+}
+```
+
+For Go-aware code generation, `go/ast` + `go/printer` (or just `go/format`) is the right surface — see `09-tooling/06-go-fmt-and-gofmt.md` for the formatter.
+
+## Standard Library Hooks
+
+- `go/ast`, `go/parser`, `go/printer`, `go/format` — parse and emit Go source.
+- `text/template`, `html/template` — render arbitrary text from data.
+- `os/exec` — invoke external generators.
+- `embed` — replaces many old generation patterns.
+- `golang.org/x/tools/cmd/stringer` — the canonical example generator.
+- `golang.org/x/tools/go/packages` — load packages for analysis-driven generators.
+
+## Real-World Patterns
+
+### 1. Pinned stringer
+
+```go
+//go:generate go run golang.org/x/tools/cmd/stringer@v0.20.0 -type=Status
+type Status int
+const (
+    Pending Status = iota
+    Active
+    Done
+)
+```
+
+### 2. tool directive (1.24+) + go tool
+
+```
+// go.mod
+tool (
+    golang.org/x/tools/cmd/stringer
+    github.com/golang/mock/mockgen
+)
+```
+
+```go
+//go:generate go tool stringer -type=Status
+//go:generate go tool mockgen -source=store.go -destination=mock/mock_store.go
+```
+
+### 3. CI regeneration check
+
+```yaml
+- run: |
+    go install golang.org/x/tools/cmd/stringer@v0.20.0
+    go install github.com/golang/mock/mockgen@v1.6.0
+- run: go generate ./...
+- run: git diff --exit-code
+```
+
+### 4. Conditional generation
+
+```go
+//go:generate -run=stringer go run ./gen-fancy
+```
+
+Use the same target for multiple generators; filter via `-run`.
+
+### 5. Make rule wrapper
+
+```makefile
+.PHONY: generate
+generate:
+	go generate ./...
+	gofmt -s -w .
+
+.PHONY: verify-generate
+verify-generate: generate
+	@if ! git diff --quiet; then \
+	    echo "generated files out of date"; \
+	    exit 1; \
+	fi
+```
+
+### 6. Templated multi-version code
+
+```go
+//go:generate go run ./gen -versions=v1,v2,v3
+```
+
+Custom generator emits `v1.go`, `v2.go`, `v3.go` from a single template.
+
+## Anti-Patterns & Gotchas
+
+**Running `go generate` from CI's `go build` step.** Generation needs network (proxy fetch), tools installed, and possibly secrets. Run it locally; commit the output.
+
+**Forgetting to commit generated files.** `gitignore`-ing them forces every contributor to run `go generate` before they can build. Source-controlled output is the norm.
+
+**Generators with non-deterministic output.** Timestamps, random UUIDs, map iteration order — all break idempotency. Sort keys; pass `--no-timestamps` where the tool supports it.
+
+**Mixing `go generate` paths with hardcoded ones.** A directive that writes to `/tmp/foo.go` produces a file in the directive's dir. Use `$GOFILE`, relative paths, or `-output=...` to be explicit.
+
+**Not pinning tool versions.** `stringer` upgraded between contributors → diff churn. Pin via `go run pkg@ver` or `go tool` (1.24+).
+
+**Generated files without the `Code generated; DO NOT EDIT.` header.** Tools can't tell them apart from hand-written; reviewers spend time linting; `gopls` may suggest refactors.
+
+**Generators that depend on uncommitted state.** A generator reading the working directory's `.env` produces different output per developer. Pass inputs explicitly.
+
+**Generating Go code without running it through `go/format.Source`.** Output looks ugly; CI's `gofmt -l` complains. Always format generator output.
+
+**Putting `//go:generate` in test files for non-test artifacts.** `go generate ./...` picks up `_test.go` files too — fine — but contributors expect generation to be runnable from the package root, not from running tests.
+
+**Calling `go generate` from inside another `go generate`.** Possible but a debugging nightmare. Use a top-level `make generate` for orchestration.
+
+**Using `go generate` for what `embed` can do.** Embedding static files no longer needs a generator since 1.16. Replace `go-bindata` directives with `//go:embed`.
+
+**Forgetting CI installs the generator binaries.** A `mockgen` directive in `pre-submit` fails if mockgen isn't on `$PATH`. Either pre-install, use `go run`, or use `go tool`.
+
+## Performance Notes
+
+- `go generate ./...` walks every `.go` file in the module: ~ms per file.
+- Most generators dwarf this — `stringer` for one type: ~1 s; `protoc` for a non-trivial schema: 5–30 s; `mockgen` for a 20-method interface: ~2 s.
+- `go generate -n`: just prints; effectively free.
+- `go run pkg@ver`-style directives add compile cost (~1 s) per generator invocation; cached on subsequent runs.
+
+Generation is rarely a build bottleneck; it's a developer-loop concern. Optimize for diff-friendliness (deterministic output) and tool-version control.
+
+## How Big Companies Use It
+
+- **Google** generates large amounts of Go from internal IDLs (Stubby, Spanner schemas); `go generate` runs at code-import time, not build time: https://go.dev/blog/generate.
+- **Kubernetes** uses `go generate` plus `code-generator/` for deepcopy/conversion/clientset: https://github.com/kubernetes/code-generator.
+- **HashiCorp** uses `go generate` heavily for Terraform provider boilerplate (`tfplugindocs`, `code-generation`): https://github.com/hashicorp/terraform-provider-aws.
+- **Uber** has internal generators for thrift/proto and `go-mock`; CI verifies generation drift: https://github.com/uber-go.
+- **CockroachDB** generates SQL parser code via `sqlfmt` and protobuf clients via `protoc`: https://github.com/cockroachdb/cockroach.
+- **Discord's Go services** rely on `sqlc`-generated DB code; `go generate` is part of every contributor's local workflow.
+- **Tailscale** uses `cloner` and `viewer` generators (custom, in their `cmd/` tree) for immutability-by-default: https://github.com/tailscale/tailscale.
+
+## Source Code References
+
+Pinned to `go1.26`.
+
+- `go generate`: [`src/cmd/go/internal/generate/generate.go`](https://github.com/golang/go/blob/release-branch.go1.26/src/cmd/go/internal/generate/generate.go).
+- Directive scanner: same file (search `directiveRegex`).
+- `stringer`: [`golang.org/x/tools/cmd/stringer`](https://github.com/golang/tools/tree/master/cmd/stringer).
+- `mockgen`: [`github.com/golang/mock/mockgen`](https://github.com/golang/mock/tree/main/mockgen).
+- `protoc-gen-go`: [`google.golang.org/protobuf/cmd/protoc-gen-go`](https://github.com/protocolbuffers/protobuf-go/tree/master/cmd/protoc-gen-go).
+- `sqlc`: [`github.com/sqlc-dev/sqlc`](https://github.com/sqlc-dev/sqlc).
+
+(BSD-3-Clause © The Go Authors.)
+
+## Further Reading
+
+- "Generating code" (Rob Pike, Go blog): https://go.dev/blog/generate.
+- "go generate reference": https://pkg.go.dev/cmd/go#hdr-Generate_Go_files_by_processing_source.
+- "stringer: writing Go programs to write Go programs": https://pkg.go.dev/golang.org/x/tools/cmd/stringer.
+- "Go modules: tool dependencies" (1.24+): https://tip.golang.org/doc/go1.24#tools.
+- "Code generation with Go templates" (Mat Ryer): https://pace.dev/blog/2020/02/12/why-you-shouldnt-use-func-main-in-golang-by-mat-ryer.html.
+- buf docs (modern protoc replacement): https://buf.build/docs.
+
+## Exercises / Self-Check
+
+1. Add a `//go:generate stringer -type=Foo` directive. Pin the version using `go run`. Run `go generate` and inspect the output.
+2. Convert a `tools.go` pin to a 1.24-style `tool` directive and update `//go:generate` accordingly.
+3. Write a custom generator under `internal/codegen` that emits a file from a `text/template`. Wire it via `//go:generate`.
+4. Why does CI usually run `git diff --exit-code` after `go generate`? Construct a case where it would fail meaningfully.
+5. Use `go generate -n ./...` to see what *would* happen without running. Useful when?
